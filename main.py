@@ -5,6 +5,8 @@ import plotly.express as px
 import numpy as np
 import math
 import asyncio
+import requests
+import io
 import nest_asyncio
 import re
 import time
@@ -49,8 +51,18 @@ COLOR_MAP = {"1. LEADING": "#006400", "2. WEAKENING": "#FFA500", "3. LAGGING": "
 def get_market_constituents(market_key):
     try:
         mkt = MARKETS[market_key]
-        headers = {"User-Agent": "Mozilla/5.0"}
-        tables = pd.read_html(mkt['wiki'])
+        # We gebruiken een "echte" browser User-Agent om de blokkade te omzeilen
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        # Eerst de HTML ophalen met requests
+        response = requests.get(mkt['wiki'], headers=headers)
+        response.raise_for_status() # Check of de pagina bestaat
+        
+        # Pandas laten lezen vanuit de tekst string
+        tables = pd.read_html(io.StringIO(response.text))
+        
         target_df = pd.DataFrame()
         for df in tables:
             cols = [str(c).lower() for c in df.columns]
@@ -60,7 +72,7 @@ def get_market_constituents(market_key):
         
         if target_df.empty: return pd.DataFrame()
         
-        # Kolom mapping normaliseren
+        # Kolommen opschonen
         cols = target_df.columns
         ticker_col = next(c for c in cols if "Symbol" in str(c) or "Ticker" in str(c))
         sector_col = next((c for c in cols if "Sector" in str(c)), None)
@@ -74,8 +86,9 @@ def get_market_constituents(market_key):
         df_clean.columns = ['Ticker', 'Sector']
         df_clean['Ticker'] = df_clean['Ticker'].str.replace('.', '-', regex=False)
         return df_clean
+
     except Exception as e:
-        st.error(f"Fout bij ophalen data: {e}")
+        st.error(f"Fout bij ophalen data van Wikipedia: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
