@@ -2,9 +2,10 @@ streamlit
 yfinance
 pandas
 plotly
-google-generativeai
-requests
 numpy
+google-genai
+scikit-learn
+scipy
+statsmodels
+nest_asyncio
 lxml
-openpyxl
-matplotlib
