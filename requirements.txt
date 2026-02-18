@@ -1,0 +1,10 @@
+streamlit
+yfinance
+pandas
+plotly
+google-generativeai
+requests
+numpy
+lxml
+openpyxl
+matplotlib
