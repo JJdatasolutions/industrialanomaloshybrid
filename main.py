@@ -317,36 +317,63 @@ with tab_screener:
             if not constituents.empty:
                 # Sector Filter
                 if sector_sel != "Alle":
-                    tickers = constituents[constituents['Sector'] == sector_sel]['Ticker'].tolist()
+                    # Let op: Soms heet de kolom 'Sector' anders, we checken dit veiliger
+                    if 'Sector' in constituents.columns:
+                        tickers = constituents[constituents['Sector'] == sector_sel]['Ticker'].tolist()
+                    else:
+                        st.warning("Sector data niet beschikbaar voor deze markt. Alle tickers worden gebruikt.")
+                        tickers = constituents['Ticker'].head(80).tolist()
                 else:
                     tickers = constituents['Ticker'].head(80).tolist() # Limit voor demo snelheid
                 
-                tickers = list(set(tickers + [cfg['benchmark']]))
+                # Zorg dat de benchmark erbij zit en uniek is
+                bench = cfg['benchmark']
+                tickers = list(set(tickers + [bench]))
+                
+                st.write(f"Data ophalen voor {len(tickers)} tickers...") # Debug info
                 df_prices = get_price_data(tickers)
                 
-                if not df_prices.empty:
-                    rrg_df = calculate_rrg_signals(df_prices, cfg['benchmark'])
+                if not df_prices.empty and bench in df_prices.columns:
+                    rrg_df = calculate_rrg_signals(df_prices, bench)
                     
-                    # VISUALISATIE
-                    fig = px.scatter(rrg_df, x="RS-Ratio", y="RS-Momentum", color="Kwadrant", 
-                                     text="Ticker", hover_data=["Heading", "Candidate"],
-                                     color_discrete_map=COLOR_MAP, height=600)
-                    fig.add_hline(y=100, line_dash="dash", line_color="grey")
-                    fig.add_vline(x=100, line_dash="dash", line_color="grey")
-                    # Highlight de "Holy Grail" zone (NO)
-                    fig.add_shape(type="rect", x0=100, y0=100, x1=110, y1=110, line=dict(color="Green"), fillcolor="rgba(0,255,0,0.1)")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # FILTEREN
-                    candidates = rrg_df[rrg_df['Candidate'] == True].sort_values('Distance', ascending=False)
-                    st.success(f"{len(candidates)} kandidaten gevonden voor de AI-laag.")
-                    st.dataframe(candidates[['Ticker', 'Kwadrant', 'Heading', 'Distance']])
-                    
-                    # SLA OP VOOR VOLGENDE STAP
-                    st.session_state['rrg_candidates'] = candidates['Ticker'].head(10).tolist() # Top 10
-                    st.session_state['price_data'] = df_prices
+                    # --- DE CRUCIALE CHECK ---
+                    if rrg_df.empty:
+                        st.error("RRG Berekening leverde geen resultaten op. Controleer of er genoeg historische data is.")
+                    else:
+                        # Controleren of alle kolommen bestaan
+                        required_cols = ["RS-Ratio", "RS-Momentum", "Kwadrant", "Ticker", "Heading", "Candidate"]
+                        missing = [c for c in required_cols if c not in rrg_df.columns]
+                        
+                        if missing:
+                            st.error(f"Ontbrekende kolommen in RRG data: {missing}")
+                        else:
+                            # VISUALISATIE (Nu veilig)
+                            try:
+                                fig = px.scatter(rrg_df, x="RS-Ratio", y="RS-Momentum", color="Kwadrant", 
+                                                 text="Ticker", hover_data=["Heading", "Candidate"],
+                                                 color_discrete_map=COLOR_MAP, height=600)
+                                fig.add_hline(y=100, line_dash="dash", line_color="grey")
+                                fig.add_vline(x=100, line_dash="dash", line_color="grey")
+                                fig.add_shape(type="rect", x0=100, y0=100, x1=110, y1=110, line=dict(color="Green"), fillcolor="rgba(0,255,0,0.1)")
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # FILTEREN
+                                candidates = rrg_df[rrg_df['Candidate'] == True].sort_values('Distance', ascending=False)
+                                if not candidates.empty:
+                                    st.success(f"{len(candidates)} kandidaten gevonden voor de AI-laag.")
+                                    st.dataframe(candidates[['Ticker', 'Kwadrant', 'Heading', 'Distance']])
+                                    
+                                    # SLA OP VOOR VOLGENDE STAP
+                                    st.session_state['rrg_candidates'] = candidates['Ticker'].head(10).tolist()
+                                    st.session_state['price_data'] = df_prices
+                                else:
+                                    st.warning("Geen kandidaten gevonden die aan de criteria (Leading/Improving + Heading 0-90°) voldoen.")
+                            except Exception as e:
+                                st.error(f"Fout bij plotten: {e}")
                 else:
-                    st.error("Geen prijsdata.")
+                    st.error(f"Kon geen prijsdata ophalen of benchmark '{bench}' ontbreekt in data.")
+            else:
+                st.error("Kon geen tickers ophalen van Wikipedia. Check je internetverbinding of Wikipedia status.")
 
 # === TAB 2: EXECUTION ===
 with tab_execution:
