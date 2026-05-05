@@ -11,8 +11,12 @@ import pandas as pd
 import numpy as np
 import requests
 import io
-import yfinance as yf
+import httpx
+import pandas as pd
 import streamlit as st
+from bs4 import BeautifulSoup
+from typing import Optional
+import yfinance as yf
 import plotly.express as px
 from google import genai
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
@@ -41,71 +45,83 @@ COLOR_MAP: Dict[str, str] = {
 }
 
 
-# --- 2. DATA ADAPTERS (De stekkertjes naar de buitenwereld) ---
-class MarketDataProvider:
-    """Verantwoordelijk voor het ophalen van externe ruwe data."""
-    
+# --- 2. ROBUUSTE DATA ADAPTERS ---
+
+class WikipediaMarketAdapter:
+    """
+    Deze klasse fungeert als een schild tussen Wikipedia en onze app.
+    Het haalt de data op, controleert op fouten, en vertaalt het veilig.
+    """
+
     @staticmethod
     @st.cache_data(ttl=24*3600)
-    def get_constituents(market_key: str) -> pd.DataFrame:
-        """Haalt de lijst van aandelen op via Wikipedia."""
-        try:
-            url = MARKETS[market_key]['wiki']
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            tables = pd.read_html(io.StringIO(response.text))
-            
-            # Zoek de juiste tabel op basis van sleutelwoorden
-            target_df = pd.DataFrame()
-            for df in tables:
-                cols = [str(c).lower() for c in df.columns]
-                if any("symbol" in c or "ticker" in c for c in cols):
-                    target_df = df
-                    break
-                    
-            if target_df.empty:
-                return pd.DataFrame()
-                
-            # Identificeer de juiste kolommen dynamisch
-            cols = target_df.columns
-            ticker_col = next((c for c in cols if "symbol" in str(c).lower() or "ticker" in str(c).lower()), None)
-            sector_col = next((c for c in cols if "sector" in str(c).lower()), None)
-            
-            if not ticker_col:
-                return pd.DataFrame()
+    def get_market_constituents(market_key: str) -> pd.DataFrame:
+        """
+        Haalt de tickers en sectoren op van Wikipedia via een veilig extractieproces.
 
-            df_clean = pd.DataFrame()
-            df_clean['Ticker'] = target_df[ticker_col].astype(str).str.replace('.', '-', regex=False)
-            df_clean['Sector'] = target_df[sector_col] if sector_col else "Unknown"
+        Args:
+            market_key (str): De sleutel van de markt (bijv. "🇺🇸 USA - S&P 500").
+
+        Returns:
+            pd.DataFrame: Een opgeschoonde dataframe met 'Ticker' en 'Sector'.
+        """
+        try:
+            mkt = MARKETS.get(market_key)
+            if not mkt:
+                raise KeyError(f"Markt {market_key} niet gevonden in configuratie.")
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9"
+            }
             
+            # We gebruiken httpx (moderner dan requests) met een timeout van 15 seconden
+            with httpx.Client(timeout=15.0) as client:
+                response = client.get(mkt['wiki'], headers=headers)
+                response.raise_for_status()
+
+            # Stap 1: Parsen met BeautifulSoup om de [Errno 2] Pandas fout te voorkomen
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Stap 2: We zoeken specifiek naar de data-tabel (dit is razendsnel: O(1))
+            table = soup.find('table', {'class': 'wikitable'})
+            if not table:
+                raise ValueError("Kon de hoofdtabel ('wikitable') niet vinden op Wikipedia.")
+
+            # Stap 3: Nu is het 100% veilig om Pandas te gebruiken op dit kleine stukje HTML
+            df = pd.read_html(io.StringIO(str(table)))[0]
+            
+            # Stap 4: Dynamisch kolommen detecteren
+            cols = [str(c).lower() for c in df.columns]
+            
+            # Zoek de kolom voor Ticker/Symbol
+            ticker_idx = next((i for i, c in enumerate(cols) if "symbol" in c or "ticker" in c), None)
+            # Zoek de kolom voor Sector (als deze bestaat)
+            sector_idx = next((i for i, c in enumerate(cols) if "sector" in c), None)
+
+            if ticker_idx is None:
+                raise ValueError("Kon geen Ticker/Symbol kolom vinden in de tabel.")
+
+            # Stap 5: Dataframe netjes opbouwen
+            df_clean = pd.DataFrame()
+            df_clean['Ticker'] = df.iloc[:, ticker_idx].astype(str).str.replace('.', '-', regex=False)
+            df_clean['Sector'] = df.iloc[:, sector_idx] if sector_idx is not None else "Unknown"
+
             return df_clean
 
-        except requests.RequestException as e:
-            st.error(f"Netwerkfout bij ophalen Wikipedia data: {e}")
+        except httpx.HTTPError as net_err:
+            st.error(f"Netwerkfout bij het verbinden met Wikipedia: {net_err}")
+            return pd.DataFrame()
+        except ValueError as val_err:
+            st.error(f"Fout bij het lezen van de data: {val_err}")
             return pd.DataFrame()
         except Exception as e:
-            st.error(f"Onverwachte fout bij dataverwerking: {e}")
+            st.error(f"Er is een onverwachte fout opgetreden: {e}")
             return pd.DataFrame()
 
-    @staticmethod
-    @st.cache_data(ttl=3600)
-    def get_price_data(tickers: List[str], period: str = "1y") -> pd.DataFrame:
-        """Haalt historische prijsdata op via yfinance."""
-        if not tickers:
-            return pd.DataFrame()
-        try:
-            data = yf.download(tickers, period=period, progress=False, auto_adjust=True)
-            if isinstance(data.columns, pd.MultiIndex):
-                if 'Close' in data.columns.get_level_values(0):
-                    data = data['Close']
-                elif 'Close' in data.columns.get_level_values(1):
-                    data = data.xs('Close', level=1, axis=1)
-            return data
-        except Exception as e:
-            st.warning(f"Fout bij ophalen prijsdata: {e}")
-            return pd.DataFrame()
+# Vervang je oude aanroep door deze nieuwe methode
+# In TAB 1 verander je: constituents = get_market_constituents(market_sel)
+# Naar: constituents = WikipediaMarketAdapter.get_market_constituents(market_sel)
 
 
 # --- 3. DOMEIN LOGICA (De wiskundige kern) ---
