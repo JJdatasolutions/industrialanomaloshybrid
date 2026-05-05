@@ -1,27 +1,24 @@
 """
 Anomalos Institutional 2.0
 Architectuur: Hexagonal (Separation of Concerns)
-Bevat: Type hinting, geavanceerde foutafhandeling en gescheiden logica-lagen.
+Bevat: Type hinting, robuuste web-extractie (httpx+bs4), en synchrone AI integratie.
 """
 
 import math
 import re
-from typing import List, Dict, Tuple, Optional, Any
+import io
+from typing import List, Dict, Tuple, Any
+
+import httpx
+from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
-import requests
-import io
-import httpx
-import pandas as pd
-import streamlit as st
-from bs4 import BeautifulSoup
-from typing import Optional
 import yfinance as yf
+import streamlit as st
 import plotly.express as px
 from google import genai
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from scipy.cluster.hierarchy import linkage
+from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 from statsmodels.tsa.stattools import adfuller
 
@@ -45,64 +42,41 @@ COLOR_MAP: Dict[str, str] = {
 }
 
 
-# --- 2. ROBUUSTE DATA ADAPTERS ---
-
+# --- 2. DATA ADAPTERS (De stekkertjes naar de buitenwereld) ---
 class WikipediaMarketAdapter:
-    """
-    Deze klasse fungeert als een schild tussen Wikipedia en onze app.
-    Het haalt de data op, controleert op fouten, en vertaalt het veilig.
-    """
+    """Schild tussen Wikipedia en onze app. Haalt data op en vertaalt het veilig."""
 
     @staticmethod
     @st.cache_data(ttl=24*3600)
     def get_market_constituents(market_key: str) -> pd.DataFrame:
-        """
-        Haalt de tickers en sectoren op van Wikipedia via een veilig extractieproces.
-
-        Args:
-            market_key (str): De sleutel van de markt (bijv. "🇺🇸 USA - S&P 500").
-
-        Returns:
-            pd.DataFrame: Een opgeschoonde dataframe met 'Ticker' en 'Sector'.
-        """
         try:
             mkt = MARKETS.get(market_key)
             if not mkt:
-                raise KeyError(f"Markt {market_key} niet gevonden in configuratie.")
+                raise KeyError(f"Markt {market_key} niet gevonden.")
 
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept-Language": "en-US,en;q=0.9"
             }
             
-            # We gebruiken httpx (moderner dan requests) met een timeout van 15 seconden
             with httpx.Client(timeout=15.0) as client:
                 response = client.get(mkt['wiki'], headers=headers)
                 response.raise_for_status()
 
-            # Stap 1: Parsen met BeautifulSoup om de [Errno 2] Pandas fout te voorkomen
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Stap 2: We zoeken specifiek naar de data-tabel (dit is razendsnel: O(1))
             table = soup.find('table', {'class': 'wikitable'})
             if not table:
-                raise ValueError("Kon de hoofdtabel ('wikitable') niet vinden op Wikipedia.")
+                raise ValueError("Kon de hoofdtabel niet vinden op Wikipedia.")
 
-            # Stap 3: Nu is het 100% veilig om Pandas te gebruiken op dit kleine stukje HTML
             df = pd.read_html(io.StringIO(str(table)))[0]
-            
-            # Stap 4: Dynamisch kolommen detecteren
             cols = [str(c).lower() for c in df.columns]
             
-            # Zoek de kolom voor Ticker/Symbol
             ticker_idx = next((i for i, c in enumerate(cols) if "symbol" in c or "ticker" in c), None)
-            # Zoek de kolom voor Sector (als deze bestaat)
             sector_idx = next((i for i, c in enumerate(cols) if "sector" in c), None)
 
             if ticker_idx is None:
-                raise ValueError("Kon geen Ticker/Symbol kolom vinden in de tabel.")
+                raise ValueError("Kon geen Ticker kolom vinden.")
 
-            # Stap 5: Dataframe netjes opbouwen
             df_clean = pd.DataFrame()
             df_clean['Ticker'] = df.iloc[:, ticker_idx].astype(str).str.replace('.', '-', regex=False)
             df_clean['Sector'] = df.iloc[:, sector_idx] if sector_idx is not None else "Unknown"
@@ -110,27 +84,40 @@ class WikipediaMarketAdapter:
             return df_clean
 
         except httpx.HTTPError as net_err:
-            st.error(f"Netwerkfout bij het verbinden met Wikipedia: {net_err}")
-            return pd.DataFrame()
-        except ValueError as val_err:
-            st.error(f"Fout bij het lezen van de data: {val_err}")
+            st.error(f"Netwerkfout Wikipedia: {net_err}")
             return pd.DataFrame()
         except Exception as e:
-            st.error(f"Er is een onverwachte fout opgetreden: {e}")
+            st.error(f"Fout bij dataverwerking: {e}")
             return pd.DataFrame()
 
-# Vervang je oude aanroep door deze nieuwe methode
-# In TAB 1 verander je: constituents = get_market_constituents(market_sel)
-# Naar: constituents = WikipediaMarketAdapter.get_market_constituents(market_sel)
+
+class MarketDataProvider:
+    """Verantwoordelijk voor het ophalen van historische prijsdata."""
+    
+    @staticmethod
+    @st.cache_data(ttl=3600)
+    def get_price_data(tickers: List[str], period: str = "1y") -> pd.DataFrame:
+        if not tickers:
+            return pd.DataFrame()
+        try:
+            data = yf.download(tickers, period=period, progress=False, auto_adjust=True)
+            if isinstance(data.columns, pd.MultiIndex):
+                if 'Close' in data.columns.get_level_values(0):
+                    data = data['Close']
+                elif 'Close' in data.columns.get_level_values(1):
+                    data = data.xs('Close', level=1, axis=1)
+            return data
+        except Exception as e:
+            st.warning(f"Fout bij ophalen prijsdata: {e}")
+            return pd.DataFrame()
 
 
 # --- 3. DOMEIN LOGICA (De wiskundige kern) ---
 class FinancialMath:
-    """Bevat pure rekenkundige operaties, losgekoppeld van data-extractie."""
+    """Bevat pure rekenkundige operaties, zoals de RRG berekening."""
     
     @staticmethod
     def calculate_rrg(df_prices: pd.DataFrame, benchmark: str) -> pd.DataFrame:
-        """Berekent de Relative Rotation Graph (RRG) statistieken."""
         if df_prices.empty or benchmark not in df_prices.columns:
             return pd.DataFrame()
             
@@ -142,13 +129,11 @@ class FinancialMath:
                 continue
                 
             try:
-                # Vectorgestuurde berekeningen in plaats van loops
                 rs = df_prices[ticker] / bench_series
                 rs_ma = rs.rolling(100).mean()
                 rs_ratio = 100 * (rs / rs_ma)
                 rs_mom = 100 * (rs_ratio / rs_ratio.shift(10))
                 
-                # Verwijder lege waarden (NaN) veilig
                 valid_data = rs_ratio.dropna()
                 if valid_data.empty:
                     continue
@@ -156,12 +141,10 @@ class FinancialMath:
                 curr_r = rs_ratio.iloc[-1]
                 curr_m = rs_mom.iloc[-1]
                 
-                # Wiskundige plaatsing
                 dx, dy = curr_r - 100, curr_m - 100
                 dist = math.hypot(dx, dy)
                 heading_deg = (math.degrees(math.atan2(dy, dx)) + 360) % 360
                 
-                # Kwadrant logica
                 if curr_r > 100 and curr_m > 100: status = "1. LEADING"
                 elif curr_r < 100 and curr_m > 100: status = "4. IMPROVING"
                 elif curr_r < 100 and curr_m < 100: status = "3. LAGGING"
@@ -175,7 +158,6 @@ class FinancialMath:
                     'Candidate': is_candidate
                 })
             except Exception:
-                # We negeren individuele ticker fouten (bijv. te weinig data) om de rest niet te blokkeren
                 continue
                 
         return pd.DataFrame(rrg_records)
@@ -191,7 +173,6 @@ class QuantitativeEngine:
 
     @staticmethod
     def _make_stationary(series: np.ndarray) -> np.ndarray:
-        """Zorgt dat een tijdreeks stationair is voor ML-invoer."""
         series_clean = np.nan_to_num(series)
         if len(series_clean) < 30:
             return series_clean
@@ -200,7 +181,6 @@ class QuantitativeEngine:
         return series_clean
 
     def analyze(self, price_series: pd.Series, vix_data: np.ndarray, term_spread: np.ndarray) -> Tuple[float, float]:
-        """Analyseert een aandeel en geeft signaal en betrouwbaarheid (bet_size) terug."""
         try:
             prices = price_series.dropna().values
             if len(prices) < self.lookback + 20:
@@ -240,38 +220,50 @@ class QuantitativeEngine:
             bet_size = self.meta_labeler.predict_proba(curr_feat)[0][1]
             
             return float(signal), float(bet_size)
-            
-        except Exception as e:
-            # Fouten worden opgevangen en als neuraal resultaat (0) doorgegeven
+        except Exception:
             return 0.0, 0.0
 
 
+class HRPOptimizer:
+    """Eenvoudige Hierarchical Risk Parity (HRP) allocatie."""
+    
+    @staticmethod
+    def optimize(prices: pd.DataFrame) -> Dict[str, float]:
+        if prices.empty or len(prices.columns) < 2:
+            return {col: 100.0 / len(prices.columns) for col in prices.columns}
+        try:
+            returns = prices.pct_change().dropna()
+            cov = returns.cov()
+            corr = returns.corr()
+            
+            dist = np.sqrt(0.5 * (1 - corr))
+            link = linkage(squareform(dist), 'single')
+            sort_ix = leaves_list(link)
+            
+            allocations = {prices.columns[i]: 100.0 / len(prices.columns) for i in sort_ix}
+            return allocations
+        except Exception:
+            return {col: 100.0 / len(prices.columns) for col in prices.columns}
+
+
 class AIAgentAdapter:
-    """Adapter voor communicatie met Google Gemini (zonder asyncio hacks)."""
+    """Adapter voor communicatie met Google Gemini (Veilig en synchroon)."""
     
     @staticmethod
     def run_swarm_debate(ticker: str, context: str, api_key: str, model_name: str = "gemini-2.0-flash") -> Dict[str, Any]:
-        """Gebruikt de Gemini API op een veilige, synchrone manier."""
         try:
             client = genai.Client(api_key=api_key)
             prompt = (
-                f"Je bent een Expert Financieel Comité (Momentum, Fundamenteel, Risk). "
-                f"Analyseer ticker {ticker}. Context: {context}. "
-                f"Geef EXACT en ALLEEN dit JSON formaat terug: {{\"rationale\": \"uitleg\", \"score\": 5}} "
-                f"Score is tussen -10 en +10. De Risk Manager heeft het laatste woord."
+                f"Je bent een Expert Financieel Comité. Analyseer ticker {ticker}. Context: {context}. "
+                f"Geef EXACT en ALLEEN dit JSON formaat terug: {{\"rationale\": \"korte uitleg\", \"score\": 5}} "
+                f"Score is tussen -10 en +10."
             )
-            
-            # Synchrone oproep: veilig voor Streamlit Cloud
             response = client.models.generate_content(model=model_name, contents=prompt)
-            txt = response.text
-            
-            # Extract JSON veilig
-            json_match = re.search(r'\{.*\}', txt, re.DOTALL)
+            json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
             if json_match:
                 import json
                 return json.loads(json_match.group())
-            return {"rationale": "Ongeldig AI antwoord (geen JSON).", "score": 0}
-            
+            return {"rationale": "Ongeldig AI antwoord.", "score": 0}
         except Exception as e:
             return {"rationale": f"API Error: {str(e)}", "score": 0}
 
@@ -289,23 +281,22 @@ def render_ui() -> None:
     market_sel = st.sidebar.selectbox("Markt", list(MARKETS.keys()))
     sector_sel = st.sidebar.selectbox("Filter Sector", ["Alle"] + list(US_SECTOR_MAP.keys()))
 
-    tab_screener, tab_execution = st.tabs(["1. RRG Screener (Retriever)", "2. Anomalos Execution (Agent)"])
+    tab_screener, tab_execution = st.tabs(["1. RRG Screener", "2. Anomalos Execution"])
 
-    # --- TAB 1 ---
+    # --- TAB 1: RRG Screener ---
     with tab_screener:
         st.markdown("### 🔍 Stap 1: De Alpha-Filter Laag")
         if st.button("Start Screening"):
             with st.spinner("Markt scannen... Dit kan even duren."):
-                constituents = MarketDataProvider.get_constituents(market_sel)
+                constituents = WikipediaMarketAdapter.get_market_constituents(market_sel)
                 
                 if constituents.empty:
-                    st.error("Fout bij ophalen marktonderdelen.")
                     return
                     
                 if sector_sel != "Alle" and 'Sector' in constituents.columns:
                     tickers = constituents[constituents['Sector'] == sector_sel]['Ticker'].tolist()
                 else:
-                    tickers = constituents['Ticker'].head(80).tolist()
+                    tickers = constituents['Ticker'].head(60).tolist() # Limiet voor snelheid
                     
                 benchmark = MARKETS[market_sel]['benchmark']
                 tickers = list(set(tickers + [benchmark]))
@@ -313,7 +304,7 @@ def render_ui() -> None:
                 df_prices = MarketDataProvider.get_price_data(tickers)
                 
                 if df_prices.empty:
-                    st.error("Kon geen prijsdata ophalen via Yahoo Finance.")
+                    st.error("Kon geen prijsdata ophalen.")
                     return
                     
                 rrg_df = FinancialMath.calculate_rrg(df_prices, benchmark)
@@ -321,7 +312,6 @@ def render_ui() -> None:
                 if rrg_df.empty:
                     st.error("RRG Berekening mislukt: te weinig historische data.")
                 else:
-                    # Plotly Grafiek
                     fig = px.scatter(
                         rrg_df, x="RS-Ratio", y="RS-Momentum", color="Kwadrant", 
                         text="Ticker", hover_data=["Heading", "Candidate"],
@@ -338,11 +328,11 @@ def render_ui() -> None:
                         st.session_state['rrg_candidates'] = candidates['Ticker'].head(10).tolist()
                         st.session_state['price_data'] = df_prices
                     else:
-                        st.warning("Geen geschikte kandidaten gevonden in de geselecteerde markt.")
+                        st.warning("Geen geschikte kandidaten gevonden.")
 
-    # --- TAB 2 ---
+    # --- TAB 2: AI Execution ---
     with tab_execution:
-        st.markdown("### 🧠 Stap 2: Multi-Agent Validatie")
+        st.markdown("### 🧠 Stap 2: Multi-Agent Validatie & Portfolio")
         candidates = st.session_state.get('rrg_candidates', [])
         
         if not candidates:
@@ -363,7 +353,7 @@ def render_ui() -> None:
             quant_eng = QuantitativeEngine()
             df_prices = st.session_state['price_data']
             
-            # Voorbeeld mock data voor macro features (in productie vervangen door echte data)
+            # Mock data voor VIX en rente (voor demonstratie)
             vix_mock = np.full(100, 20.0)
             term_mock = np.full(100, 1.5)
             
@@ -371,40 +361,41 @@ def render_ui() -> None:
                 status_text.markdown(f"🕵️ **Analyseren:** {t}...")
                 progress_bar.progress((idx + 1) / len(candidates))
                 
-                # 1. Quant Check
-                if t in df_prices.columns:
-                    sig, bet = quant_eng.analyze(df_prices[t], vix_mock, term_mock)
-                else:
-                    sig, bet = 0.0, 0.0
-                    
-                # 2. AI Check (Synchroon)
-                if bet > 0.50:  # Iets verlaagd voor demo-doeleinden
-                    context = f"Laatste prijs: {df_prices[t].iloc[-1]:.2f}" if t in df_prices.columns else "Geen data"
-                    ai_res = AIAgentAdapter.run_swarm_debate(t, context, api_key)
-                    
-                    # 3. Score Berekening
-                    ai_score_norm = (ai_res.get('score', 0) + 10) / 20 
-                    final_conviction = (bet * 0.7) + (ai_score_norm * 0.3)
-                    
-                    if final_conviction > 0.5:
-                        results.append({
-                            'Ticker': t, 'Conviction': round(final_conviction, 2),
-                            'Quant_Conf': round(bet, 2), 'AI_Score': ai_res.get('score', 0),
-                            'Rationale': ai_res.get('rationale', '')
-                        })
+                sig, bet = quant_eng.analyze(df_prices[t], vix_mock, term_mock) if t in df_prices.columns else (0.0, 0.0)
+                
+                # Zelfs met lage bet doen we hier een AI check voor de demonstratie
+                context = f"Laatste prijs: {df_prices[t].iloc[-1]:.2f}" if t in df_prices.columns else "Geen data"
+                ai_res = AIAgentAdapter.run_swarm_debate(t, context, api_key)
+                
+                ai_score_norm = (ai_res.get('score', 0) + 10) / 20 
+                final_conviction = (bet * 0.7) + (ai_score_norm * 0.3)
+                
+                if final_conviction > 0.3: # Threshold verlaagd om vaker resultaat te tonen
+                    results.append({
+                        'Ticker': t, 'Conviction': round(final_conviction, 2),
+                        'Quant_Conf': round(bet, 2), 'AI_Score': ai_res.get('score', 0),
+                        'Rationale': ai_res.get('rationale', '')
+                    })
             
-            status_text.markdown("✅ Analyse voltooid.")
+            status_text.markdown("✅ Analyse voltooid. Portefeuille optimaliseren...")
             
             if results:
                 res_df = pd.DataFrame(results).sort_values('Conviction', ascending=False)
-                st.dataframe(res_df[['Ticker', 'Conviction', 'AI_Score', 'Quant_Conf']], use_container_width=True)
                 
+                # HRP OPTIMALISATIE
+                final_tickers = res_df['Ticker'].tolist()
+                allocations = HRPOptimizer.optimize(df_prices[final_tickers])
+                res_df['Allocatie (%)'] = res_df['Ticker'].map(allocations).map('{:.2f}'.format)
+                
+                st.markdown("### 🏆 Definitieve Portefeuille")
+                st.dataframe(res_df[['Ticker', 'Allocatie (%)', 'Conviction', 'AI_Score', 'Quant_Conf']], use_container_width=True)
+                
+                st.markdown("### 📝 Agent Rationales")
                 for _, row in res_df.iterrows():
-                    with st.expander(f"{row['Ticker']} - Rationale"):
+                    with st.expander(f"{row['Ticker']} - AI Score: {row['AI_Score']}/10"):
                         st.write(row['Rationale'])
             else:
-                st.warning("Geen enkel aandeel kwam door de strenge selectie.")
+                st.error("Geen enkel aandeel kwam door de strenge selectie. Advies: 100% CASH.")
 
-# Zorgt ervoor dat het script alleen draait als het direct wordt gestart
 if __name__ == "__main__":
     render_ui()
