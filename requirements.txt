@@ -9,3 +9,5 @@ scipy
 statsmodels
 nest_asyncio
 lxml
+httpx
+BeautifulSoup
